@@ -1,10 +1,77 @@
+import random
+import re
+
 from datasets import load_dataset
 from tokenizer import Tokenizer
 import torch
 from torch.utils.data import Dataset
 
 
+DATASET_NAME = "DSWF/conversation-dataset"
 IGNORE_INDEX = -100
+
+# Datasættet indeholder UTF-8 tegn, der er blevet læst som GBK,
+# f.eks. "What鈥檚" i stedet for "What’s".
+MOJIBAKE = re.compile(r"[\u2e80-\u9fff]+")
+
+
+def _repair_match(match):
+    try:
+        return match.group().encode("gbk").decode("utf-8")
+    except UnicodeError:
+        return match.group()
+
+
+def clean_text(text):
+    text = MOJIBAKE.sub(_repair_match, text or "")
+    # Datasættet blander ’ og ' i de samme ord
+    return text.replace("’", "'").strip()
+
+
+def load_conversation_rows():
+    """Hent datasættet som en liste af rensede {"Text", "Answer"} rækker."""
+    rows = []
+    seen = set()
+
+    for row in load_dataset(DATASET_NAME, split="train"):
+
+        # En ekstra kolonne betyder, at rækken er en CSV-fejl i datasættet
+        if row["Unnamed: 2"] is not None:
+            continue
+
+        question = clean_text(row["Text"])
+        answer = clean_text(row["Answer"])
+
+        # Spring tomme rækker og tekst, der ikke kunne repareres, over
+        if not question or not answer or MOJIBAKE.search(question + answer):
+            continue
+
+        # Spring dubletter over
+        if (question, answer) in seen:
+            continue
+        seen.add((question, answer))
+
+        rows.append({"Text": question, "Answer": answer})
+
+    return rows
+
+
+def split_rows(rows, validation_fraction=0.1, seed=42):
+    """Del rækkerne i train og validation.
+
+    Datasættet har kun et train split. Vi deler på spørgsmål, så det
+    samme spørgsmål ikke findes i både train og validation.
+    """
+    questions = sorted({row["Text"] for row in rows})
+    random.Random(seed).shuffle(questions)
+
+    validation_count = max(1, int(len(questions) * validation_fraction))
+    validation_questions = set(questions[:validation_count])
+
+    train_rows = [row for row in rows if row["Text"] not in validation_questions]
+    validation_rows = [row for row in rows if row["Text"] in validation_questions]
+
+    return train_rows, validation_rows
 
 
 class DialogDataset(Dataset):
@@ -20,31 +87,27 @@ class DialogDataset(Dataset):
 
         for row in data:
 
-            dialog = row["dialog"]
+            question = row["Text"]
+            answer = row["Answer"]
 
-            for i in range(len(dialog) - 1):
+            # Tokenize prompt og svar
+            prompt_tokens = tokenizer.encode(
+                question + "<SEP>"
+            )
 
-                question = dialog[i]
-                answer = dialog[i + 1]
+            answer_tokens = tokenizer.encode(
+                answer + "<END>"
+            )
 
-                # Tokenize prompt og svar
-                prompt_tokens = tokenizer.encode(
-                    question + "<SEP>"
-                )
+            tokens = prompt_tokens + answer_tokens
 
-                answer_tokens = tokenizer.encode(
-                    answer + "<END>"
-                )
+            # Spring eksempler over, der er for lange
+            if len(tokens) > context_length + 1:
+                continue
 
-                tokens = prompt_tokens + answer_tokens
-
-                # Spring eksempler over, der er for lange
-                if len(tokens) > context_length + 1:
-                    continue
-
-                self.examples.append(
-                    (tokens, len(prompt_tokens))
-                )
+            self.examples.append(
+                (tokens, len(prompt_tokens))
+            )
 
         if not self.examples:
             raise ValueError("No valid training examples found.")
@@ -82,16 +145,14 @@ if __name__ == "__main__":
 
     tokenizer = Tokenizer()
 
-    train_dataset = load_dataset(
-        "OpenRL/daily_dialog",
-        split="train"
-    )
+    train_dataset, validation_dataset = split_rows(load_conversation_rows())
 
     datasetter = DialogDataset(train_dataset, tokenizer)
 
     x, y = datasetter[0]
 
-    print("Number of dialogs:", len(train_dataset))
+    print("Number of train rows:", len(train_dataset))
+    print("Number of validation rows:", len(validation_dataset))
     print("Number of training examples:", len(datasetter))
 
     print("\nInput:")

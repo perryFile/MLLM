@@ -3,22 +3,25 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-from dataset import DialogDataset, IGNORE_INDEX
+from config import CONTEXT_LENGTH, DROPOUT, EMBEDDING_DIM, NUM_HEADS, NUM_LAYERS
+from dataset import (
+    DATASET_NAME,
+    DialogDataset,
+    IGNORE_INDEX,
+    load_conversation_rows,
+    split_rows,
+)
 from models.model import MiniGPT
 from tokenizer import Tokenizer
 
 
-CONTEXT_LENGTH = 128
-EMBEDDING_DIM = 128
-NUM_HEADS = 4
-NUM_LAYERS = 4
+OVERFIT_EXAMPLES = 8
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train MiniGPT on DailyDialog")
+    parser = argparse.ArgumentParser(description=f"Train MiniGPT on {DATASET_NAME}")
     parser.add_argument("--mode", choices=("overfit", "full"), default="overfit")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -26,6 +29,12 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("."))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=3,
+        help="Stop full mode after this many epochs without a better validation loss (0 disables)",
+    )
     return parser.parse_args()
 
 
@@ -80,18 +89,26 @@ def main():
     print(f"Mode: {args.mode}; device: {device}; epochs: {epochs}; batch size: {batch_size}")
 
     tokenizer = Tokenizer()
-    dataset = load_dataset("OpenRL/daily_dialog")
+    train_rows, validation_rows = split_rows(load_conversation_rows(), seed=args.seed)
     if tokenizer.vocab_size == 0:
         tokenizer.train(
-            "<SEP>".join(row["dialog"]) + "<END>" for row in dataset["train"]
+            row["Text"] + "<SEP>" + row["Answer"] + "<END>" for row in train_rows
         )
 
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
 
-    train_data = dataset["train"].select(range(1)) if args.mode == "overfit" else dataset["train"]
-    print(train_data[0]["dialog"])
+    if args.mode == "overfit":
+        # Kun ét svar pr. spørgsmål. Med flere forskellige svar på det samme
+        # spørgsmål kan modellen ikke lære dem alle udenad.
+        first_answers = {}
+        for row in train_rows:
+            first_answers.setdefault(row["Text"], row)
+        train_data = list(first_answers.values())[:OVERFIT_EXAMPLES]
+    else:
+        train_data = train_rows
+    print(train_data[0])
     train_dataset = DialogDataset(train_data, tokenizer, CONTEXT_LENGTH)
-    validation_dataset = DialogDataset(dataset["validation"], tokenizer, CONTEXT_LENGTH)
+    validation_dataset = DialogDataset(validation_rows, tokenizer, CONTEXT_LENGTH)
     loader_options = {
         "num_workers": args.num_workers,
         "pin_memory": device.type == "cuda",
@@ -113,10 +130,13 @@ def main():
         embedding_dim=EMBEDDING_DIM,
         num_heads=NUM_HEADS,
         num_layers=NUM_LAYERS,
+        # Ingen dropout i overfit mode, hvor modellen skal lære data udenad
+        dropout=0.0 if args.mode == "overfit" else DROPOUT,
     ).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     best_selection_loss = float("inf")
+    epochs_without_improvement = 0
     best_path = args.checkpoint_dir / f"miniGPT_{args.mode}_best.pth"
     final_path = args.checkpoint_dir / f"miniGPT_{args.mode}_final.pth"
 
@@ -159,8 +179,23 @@ def main():
         if selection_loss < best_selection_loss:
             best_selection_loss = selection_loss
             save_checkpoint(best_path, model, optimizer, epoch + 1, args, selection_loss)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
-    save_checkpoint(final_path, model, optimizer, epochs, args, train_loss)
+        # Early stopping: stop når validation loss ikke længere bliver bedre
+        if (
+            args.mode == "full"
+            and args.patience > 0
+            and epochs_without_improvement >= args.patience
+        ):
+            print(
+                f"Stopping early: validation loss has not improved for "
+                f"{args.patience} epochs (best={best_selection_loss:.4f})"
+            )
+            break
+
+    save_checkpoint(final_path, model, optimizer, epoch + 1, args, train_loss)
     print(f"Saved best checkpoint to {best_path}")
     print(f"Saved final checkpoint to {final_path}")
 
@@ -170,59 +205,52 @@ def main():
 
         with torch.no_grad():
 
-            # Gennemgå alle samtaler
-            for dialog_idx, row in enumerate(train_data):
+            # Gennemgå alle spørgsmål
+            for i, row in enumerate(train_data):
 
-                dialog = row["dialog"]
+                # Brug spørgsmålet som prompt
+                prompt = row["Text"] + "<SEP>"
 
-                print(f"\n========== Dialog {dialog_idx + 1} ==========")
+                # Det svar modellen burde generere
+                expected = row["Answer"]
 
-                # Gennemgå alle replikker undtagen den sidste
-                for i in range(len(dialog) - 1):
+                tokens = tokenizer.encode(prompt)
 
-                    # Brug samtalen indtil dette punkt som prompt
-                    prompt = dialog[i] + "<SEP>"
+                x = torch.tensor(
+                    [tokens],
+                    dtype=torch.long,
+                    device=device
+                )
 
-                    # Det svar modellen burde generere
-                    expected = dialog[i + 1]
+                generated_tokens = []
 
-                    tokens = tokenizer.encode(prompt)
+                # Generer svaret
+                for _ in range(100):
 
-                    x = torch.tensor(
-                        [tokens],
-                        dtype=torch.long,
-                        device=device
+                    logits = model(x[:, -CONTEXT_LENGTH:])
+
+                    next_token = torch.argmax(
+                        logits[:, -1, :],
+                        dim=-1,
+                        keepdim=True
                     )
 
-                    generated_tokens = []
+                    x = torch.cat([x, next_token], dim=1)
 
-                    # Generer næste replik
-                    for _ in range(100):
+                    generated_tokens.append(next_token.item())
 
-                        logits = model(x[:, -CONTEXT_LENGTH:])
+                    generated = tokenizer.decode(generated_tokens)
 
-                        next_token = torch.argmax(
-                            logits[:, -1, :],
-                            dim=-1,
-                            keepdim=True
-                        )
+                    # Stop ved næste replik eller samtalens afslutning
+                    if "<SEP>" in generated or "<END>" in generated:
+                        break
 
-                        x = torch.cat([x, next_token], dim=1)
+                generated = generated.split("<SEP>")[0].split("<END>")[0].strip()
 
-                        generated_tokens.append(next_token.item())
-
-                        generated = tokenizer.decode(generated_tokens)
-
-                        # Stop ved næste replik eller samtalens afslutning
-                        if "<SEP>" in generated or "<END>" in generated:
-                            break
-
-                    generated = generated.split("<SEP>")[0].split("<END>")[0].strip()
-
-                    print(f"\nQuestion {i + 1}: {dialog[i]}")
-                    print(f"Expected: {expected}")
-                    print(f"Generated: {generated}")
-                    print(f"Correct: {generated == expected.strip()}")
+                print(f"\nQuestion {i + 1}: {row['Text']}")
+                print(f"Expected: {expected}")
+                print(f"Generated: {generated}")
+                print(f"Correct: {generated == expected.strip()}")
 
 
 if __name__ == "__main__":

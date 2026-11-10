@@ -5,7 +5,7 @@ from models.transformer import TransformerBlock
 
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size: int = 100, embedding_dim: int = 128, context_length: int = 128, num_heads: int = 4, num_layers: int = 4) -> None:
+    def __init__(self, vocab_size: int = 100, embedding_dim: int = 128, context_length: int = 128, num_heads: int = 4, num_layers: int = 4, dropout: float = 0.0) -> None:
         super().__init__()
         
         if embedding_dim % num_heads != 0:
@@ -17,11 +17,12 @@ class MiniGPT(nn.Module):
         self.embedding_dim = embedding_dim
         self.tokens_embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.position_embedding = nn.Embedding(self.context_length, self.embedding_dim)
+        self.dropout = nn.Dropout(dropout)
 
         #Laver transformer blocks.
         self.blocks = nn.Sequential(
             *[
-                TransformerBlock(self.embedding_dim, num_heads)
+                TransformerBlock(self.embedding_dim, num_heads, dropout)
                 for _ in range(num_layers)
             ]
         )
@@ -39,7 +40,7 @@ class MiniGPT(nn.Module):
 
         position_embeddings = self.position_embedding(positions)
 
-        x = token_embeddings + position_embeddings
+        x = self.dropout(token_embeddings + position_embeddings)
 
         #Gennem transformers
         x = self.blocks(x)
