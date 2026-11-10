@@ -4,10 +4,13 @@ from models.attention import MultiHeadAttention
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embedding_dim, num_heads):
+    def __init__(self, embedding_dim, num_heads, dropout=0.0):
         super().__init__()
         self.embedding_dim = embedding_dim 
         self.num_heads = num_heads
+
+        #Dropout
+        self.dropout = nn.Dropout(dropout)
 
         #Attention
         self.attention = MultiHeadAttention(embedding_dim, num_heads)
@@ -29,12 +32,12 @@ class TransformerBlock(nn.Module):
         output = x
         x = self.ln1(x)
         x = self.attention(x)
-        output = output + x
+        output = output + self.dropout(x)
         x = output
         # 2. MLP + residual connection
         x = self.ln2(x)
         x = self.MLP(x)
-        output = output + x
+        output = output + self.dropout(x)
         return output
 
 if __name__ == "__main__":

@@ -1,13 +1,11 @@
 import argparse
 import torch
 
+from config import CONTEXT_LENGTH, EMBEDDING_DIM, NUM_HEADS, NUM_LAYERS
 from models.model import MiniGPT
 from tokenizer import Tokenizer
 
-context_length = 128
-embedding_dim = 128
-num_heads = 4
-num_layers = 4
+context_length = CONTEXT_LENGTH
 
 max_new_tokens = 200
 temperature = 0.5
@@ -15,13 +13,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 tokenizer = Tokenizer()
 
-model = MiniGPT(
-    vocab_size=tokenizer.vocab_size,
-    context_length=context_length,
-    embedding_dim=embedding_dim,
-    num_heads=num_heads,
-    num_layers=num_layers
-)
+# Modellen bygges, når checkpointet er indlæst
+model = None
 
 @torch.no_grad()
 def generate(prompt, max_new_tokens=200, temperature=0.8, greedy=False):
@@ -85,13 +78,25 @@ def generate(prompt, max_new_tokens=200, temperature=0.8, greedy=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text with MiniGPT")
     parser.add_argument("--checkpoint", default="miniGPT_overfit_best.pth")
-    parser.add_argument("--prompt", default=" That's a good idea . I hear Mary and Sally often go there to play pingpong.Perhaps we can make a foursome with them .  <SEP>")
+    parser.add_argument("--prompt", default="How are you today?<SEP>")
     parser.add_argument("--max-new-tokens", type=int, default=max_new_tokens)
     parser.add_argument("--temperature", type=float, default=temperature)
     parser.add_argument("--greedy", action="store_true")
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+
+    # Brug modelstørrelsen fra checkpointet, så ældre checkpoints stadig virker
+    model_config = checkpoint.get("model_config", {})
+    context_length = model_config.get("context_length", CONTEXT_LENGTH)
+
+    model = MiniGPT(
+        vocab_size=tokenizer.vocab_size,
+        context_length=context_length,
+        embedding_dim=model_config.get("embedding_dim", EMBEDDING_DIM),
+        num_heads=model_config.get("num_heads", NUM_HEADS),
+        num_layers=model_config.get("num_layers", NUM_LAYERS)
+    )
     model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
     model.to(device)
     model.eval()
