@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 
 
 DATASET_NAME = "DSWF/conversation-dataset"
+PRETRAIN_DATASET_NAME = "OpenRL/daily_dialog"
 IGNORE_INDEX = -100
 
 # Datasættet indeholder UTF-8 tegn, der er blevet læst som GBK,
@@ -72,6 +73,44 @@ def split_rows(rows, validation_fraction=0.1, seed=42):
     validation_rows = [row for row in rows if row["Text"] in validation_questions]
 
     return train_rows, validation_rows
+
+
+def clean_daily_dialog_text(text):
+    """Få DailyDialog til at ligne DSWF-datasættet.
+
+    DailyDialog skriver f.eks. "That ’ s bogus ." i stedet for "That's bogus."
+    """
+    text = text.replace("’", "'").replace("‘", "'")
+    # "That ' s" -> "That's"
+    text = re.sub(r"\s+'\s+(s|t|m|re|ve|ll|d)\b", r"'\1", text)
+    # "bogus ." -> "bogus."
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _daily_dialog_pairs(split):
+    rows = []
+
+    for row in split:
+
+        dialog = [clean_daily_dialog_text(utterance) for utterance in row["dialog"]]
+
+        # Hver replik er spørgsmål til den næste replik
+        for i in range(len(dialog) - 1):
+            if dialog[i] and dialog[i + 1]:
+                rows.append({"Text": dialog[i], "Answer": dialog[i + 1]})
+
+    return rows
+
+
+def load_daily_dialog_rows():
+    """Hent DailyDialog til pretraining som {"Text", "Answer"} rækker."""
+    dataset = load_dataset(PRETRAIN_DATASET_NAME)
+
+    return (
+        _daily_dialog_pairs(dataset["train"]),
+        _daily_dialog_pairs(dataset["validation"]),
+    )
 
 
 class DialogDataset(Dataset):

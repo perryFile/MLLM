@@ -11,6 +11,7 @@ from dataset import (
     DialogDataset,
     IGNORE_INDEX,
     load_conversation_rows,
+    load_daily_dialog_rows,
     split_rows,
 )
 from models.model import MiniGPT
@@ -22,7 +23,13 @@ OVERFIT_EXAMPLES = 8
 
 def parse_args():
     parser = argparse.ArgumentParser(description=f"Train MiniGPT on {DATASET_NAME}")
-    parser.add_argument("--mode", choices=("overfit", "full"), default="overfit")
+    parser.add_argument("--mode", choices=("overfit", "full", "pretrain"), default="overfit")
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Start from the weights in this checkpoint, e.g. miniGPT_pretrain_best.pth",
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -33,7 +40,7 @@ def parse_args():
         "--patience",
         type=int,
         default=3,
-        help="Stop full mode after this many epochs without a better validation loss (0 disables)",
+        help="Stop full and pretrain mode after this many epochs without a better validation loss (0 disables)",
     )
     return parser.parse_args()
 
@@ -88,8 +95,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Mode: {args.mode}; device: {device}; epochs: {epochs}; batch size: {batch_size}")
 
+    # Overfit mode har ingen validation
+    use_validation = args.mode != "overfit"
+
     tokenizer = Tokenizer()
-    train_rows, validation_rows = split_rows(load_conversation_rows(), seed=args.seed)
+    if args.mode == "pretrain":
+        # Pretraining på DailyDialog, som er meget større
+        train_rows, validation_rows = load_daily_dialog_rows()
+    else:
+        train_rows, validation_rows = split_rows(load_conversation_rows(), seed=args.seed)
     if tokenizer.vocab_size == 0:
         tokenizer.train(
             row["Text"] + "<SEP>" + row["Answer"] + "<END>" for row in train_rows
@@ -133,6 +147,13 @@ def main():
         # Ingen dropout i overfit mode, hvor modellen skal lære data udenad
         dropout=0.0 if args.mode == "overfit" else DROPOUT,
     ).to(device)
+
+    if args.init_checkpoint is not None:
+        # Fortsæt fra en model, der allerede er trænet (f.eks. pretraining)
+        checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"Loaded weights from {args.init_checkpoint}")
+
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     best_selection_loss = float("inf")
@@ -159,7 +180,7 @@ def main():
 
         train_loss = total_loss / total_tokens
         _, train_accuracy = evaluate(model, train_loader, criterion, device)
-        if args.mode == "full":
+        if use_validation:
             validation_loss, validation_accuracy = evaluate(
                 model, validation_loader, criterion, device
             )
@@ -185,7 +206,7 @@ def main():
 
         # Early stopping: stop når validation loss ikke længere bliver bedre
         if (
-            args.mode == "full"
+            use_validation
             and args.patience > 0
             and epochs_without_improvement >= args.patience
         ):
