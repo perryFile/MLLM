@@ -101,8 +101,11 @@ if __name__ == "__main__":
     model.to(device)
     model.eval()
 
+    # Samme format som i træningen: spørgsmål uden mellemrum før <SEP>
+    prompt = args.prompt.split("<SEP>")[0].strip() + "<SEP>"
+
     response = generate(
-        args.prompt,
+        prompt,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         greedy=args.greedy
