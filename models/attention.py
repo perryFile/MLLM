@@ -3,13 +3,14 @@ import torch.nn as nn
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embedding_dim, head_size):
+    def __init__(self, embedding_dim, head_size, dropout=0.0):
         super().__init__()
         self.head_size = head_size
         self.embedding_dim = embedding_dim
         self.query = nn.Linear(embedding_dim, head_size, bias=False)
         self.key = nn.Linear(embedding_dim, head_size, bias=False)
         self.value = nn.Linear(embedding_dim, head_size, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape #B er batch size, T er sequence length, og C er embedding dimension.
@@ -21,18 +22,19 @@ class SelfAttention(nn.Module):
         attention = attention / (self.head_size ** 0.5)
         attention = attention.masked_fill(mask == 0, float("-inf"))
         weights = torch.softmax(attention, dim=-1)
+        weights = self.attn_dropout(weights)
         output = weights @ V #Matrix multiplication of the attention weights and the value matrix V. This computes the final output of the self-attention mechanism.
         return output
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embedding_dim, num_heads):
+    def __init__(self, embedding_dim, num_heads, dropout=0.0):
         super().__init__()
         self.embedding_dim = embedding_dim 
         self.num_heads = num_heads
         head_size = embedding_dim // num_heads
         self.heads = nn.ModuleList([
-            SelfAttention(embedding_dim, head_size)
+            SelfAttention(embedding_dim, head_size, dropout=dropout)
             for _ in range(num_heads)
         ])
         self.linear = nn.Linear(embedding_dim,embedding_dim)

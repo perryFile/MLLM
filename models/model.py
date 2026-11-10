@@ -5,7 +5,7 @@ from models.transformer import TransformerBlock
 
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size: int = 100, embedding_dim: int = 128, context_length: int = 128, num_heads: int = 4, num_layers: int = 4, dropout: float = 0.0) -> None:
+    def __init__(self, vocab_size: int = 100, embedding_dim: int = 128, context_length: int = 128, num_heads: int = 4, num_layers: int = 4, dropout: float = 0.0, tie_weights: bool = True) -> None:
         super().__init__()
         
         if embedding_dim % num_heads != 0:
@@ -15,6 +15,7 @@ class MiniGPT(nn.Module):
         self.vocab_size = vocab_size
         self.num_embeddings = self.vocab_size
         self.embedding_dim = embedding_dim
+        self.tie_weights = tie_weights
         self.tokens_embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.position_embedding = nn.Embedding(self.context_length, self.embedding_dim)
         self.dropout = nn.Dropout(dropout)
@@ -27,7 +28,19 @@ class MiniGPT(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(self.embedding_dim)
-        self.outputLayer = nn.Linear(self.embedding_dim, self.vocab_size)
+        self.outputLayer = nn.Linear(self.embedding_dim, self.vocab_size, bias=not tie_weights)
+
+        self.apply(self._init_weights)
+        if self.tie_weights:
+            self.outputLayer.weight = self.tokens_embedding.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x):
         B, T = x.shape #T vil her være længden af inputtet, og B vil være batch size.

@@ -13,7 +13,7 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         #Attention
-        self.attention = MultiHeadAttention(embedding_dim, num_heads)
+        self.attention = MultiHeadAttention(embedding_dim, num_heads, dropout=dropout)
 
         #Normalisering
         self.ln1 = nn.LayerNorm(embedding_dim)
@@ -23,8 +23,9 @@ class TransformerBlock(nn.Module):
         self.MLP = nn.Sequential(
             nn.Linear(embedding_dim, 4 * embedding_dim),
             nn.GELU(),
-            nn.Linear(4 * embedding_dim, embedding_dim)
+            nn.Linear(4 * embedding_dim, embedding_dim),
         )
+        self.mlp_act_dropout = nn.Dropout(dropout)
 
 
     def forward(self, x):
@@ -36,7 +37,10 @@ class TransformerBlock(nn.Module):
         x = output
         # 2. MLP + residual connection
         x = self.ln2(x)
-        x = self.MLP(x)
+        x = self.MLP[0](x)
+        x = self.MLP[1](x)
+        x = self.mlp_act_dropout(x)
+        x = self.MLP[2](x)
         output = output + self.dropout(x)
         return output
 

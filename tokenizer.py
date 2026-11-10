@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from config import VOCAB_SIZE
 from tokenizers import Tokenizer as BpeTokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
@@ -15,7 +16,7 @@ class Tokenizer:
         if self.tokenizer_file.exists():
             self.load()
 
-    def train(self, texts, vocab_size=2000):
+    def train(self, texts, vocab_size=VOCAB_SIZE):
         """Train a BPE vocabulary from an iterable of strings."""
         self._tokenizer = BpeTokenizer(BPE(unk_token="<UNK>"))
         self._tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
