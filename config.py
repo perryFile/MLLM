@@ -1,4 +1,4 @@
-# Modelstørrelse. Bruges af train.py og gemmes i hvert checkpoint,
+ # Modelstørrelse. Bruges af train.py og gemmes i hvert checkpoint,
 # så generate.py kan bygge den samme model igen.
 
 # Længste eksempel i datasættet er 63 tokens
@@ -11,9 +11,5 @@ NUM_LAYERS = 6
 
 # Dropout modvirker, at modellen lærer træningsdata udenad.
 # Bruges kun under træning i full mode.
-<<<<<<< HEAD
 DROPOUT = 0.2
-=======
-DROPOUT = 0.1
->>>>>>> 3ad93a8e641a603edebf4dbf0836bde6f4a6942a
 
