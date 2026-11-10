@@ -85,7 +85,7 @@ def generate(prompt, max_new_tokens=200, temperature=0.8, greedy=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text with MiniGPT")
     parser.add_argument("--checkpoint", default="miniGPT_overfit_best.pth")
-    parser.add_argument("--prompt", default="You wanna grab some drinks? <SEP>")
+    parser.add_argument("--prompt", default=" That's a good idea . I hear Mary and Sally often go there to play pingpong.Perhaps we can make a foursome with them .  <SEP>")
     parser.add_argument("--max-new-tokens", type=int, default=max_new_tokens)
     parser.add_argument("--temperature", type=float, default=temperature)
     parser.add_argument("--greedy", action="store_true")

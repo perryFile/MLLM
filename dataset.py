@@ -6,60 +6,100 @@ from torch.utils.data import Dataset
 
 IGNORE_INDEX = -100
 
+
 class DialogDataset(Dataset):
     def __init__(self, data, tokenizer, context_length=128):
-        self.context_length = context_length
 
-        # Tokeniser alle samtaler én gang
-        tokens = []
+        self.context_length = context_length
+        self.examples = []
+
+        # Vi bruger END som padding, da den allerede
+        # findes i dit vocabulary.
+        # Padding-targets bliver ignoreret under træning.
+        self.pad_id = tokenizer.encode("<END>")[0]
 
         for row in data:
-            text = self.format_dialog(row["dialog"])
-            tokens.extend(tokenizer.encode(text))
 
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
+            dialog = row["dialog"]
 
-        end_token = tokenizer.encode("<END>")
-        if len(end_token) != 1:
-            raise ValueError("<END> must encode to exactly one token")
-        self.padding_token_id = end_token[0]
+            for i in range(len(dialog) - 1):
 
-    def format_dialog(self, dialog):
-        return "<SEP>".join(dialog) + "<END>"
+                question = dialog[i]
+                answer = dialog[i + 1]
+
+                # Tokenize prompt og svar
+                prompt_tokens = tokenizer.encode(
+                    question + "<SEP>"
+                )
+
+                answer_tokens = tokenizer.encode(
+                    answer + "<END>"
+                )
+
+                tokens = prompt_tokens + answer_tokens
+
+                # Spring eksempler over, der er for lange
+                if len(tokens) > context_length + 1:
+                    continue
+
+                self.examples.append(
+                    (tokens, len(prompt_tokens))
+                )
+
+        if not self.examples:
+            raise ValueError("No valid training examples found.")
 
     def __len__(self):
-        number_of_targets = max(0, len(self.tokens) - 1)
-        return (number_of_targets + self.context_length - 1) // self.context_length
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        start = idx * self.context_length
-        end = start + self.context_length + 1
 
-        chunk = self.tokens[start:end]
+        tokens, prompt_length = self.examples[idx]
 
-        x = chunk[:-1]
-        y = chunk[1:]
+        # Next-token prediction
+        x = tokens[:-1]
+        y = tokens[1:]
 
-        padding_length = self.context_length - len(x)
-        if padding_length > 0:
-            x = torch.cat((
-                x,
-                torch.full((padding_length,), self.padding_token_id, dtype=torch.long),
-            ))
-            y = torch.cat((
-                y,
-                torch.full((padding_length,), IGNORE_INDEX, dtype=torch.long),
-            ))
+        # Ignorer loss på spørgsmålet,
+        # men behold forudsigelsen af første svartoken
+        for i in range(prompt_length - 1):
+            y[i] = IGNORE_INDEX
+
+        # Padding
+        padding = self.context_length - len(x)
+
+        x = x + [self.pad_id] * padding
+        y = y + [IGNORE_INDEX] * padding
+
+        x = torch.tensor(x, dtype=torch.long)
+        y = torch.tensor(y, dtype=torch.long)
 
         return x, y
 
 
 
 if __name__ == "__main__":
+
     tokenizer = Tokenizer()
-    train_dataset = load_dataset("OpenRL/daily_dialog", split="train")
+
+    train_dataset = load_dataset(
+        "OpenRL/daily_dialog",
+        split="train"
+    )
+
     datasetter = DialogDataset(train_dataset, tokenizer)
-    print(len(train_dataset))
-    print(tokenizer.decode(datasetter.__getitem__(0)[0]))
-    targets = datasetter.__getitem__(0)[1]
-    print(tokenizer.decode(targets[targets != IGNORE_INDEX].tolist()))
+
+    x, y = datasetter[0]
+
+    print("Number of dialogs:", len(train_dataset))
+    print("Number of training examples:", len(datasetter))
+
+    print("\nInput:")
+    print(tokenizer.decode(x.tolist()))
+
+    print("\nTarget:")
+    print(tokenizer.decode(y[y != IGNORE_INDEX].tolist()))
+
+    print("\nShapes:")
+    print("X:", x.shape)
+    print("Y:", y.shape)

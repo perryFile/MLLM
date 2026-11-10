@@ -86,7 +86,10 @@ def main():
             "<SEP>".join(row["dialog"]) + "<END>" for row in dataset["train"]
         )
 
+    print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
+
     train_data = dataset["train"].select(range(1)) if args.mode == "overfit" else dataset["train"]
+    print(train_data[0]["dialog"])
     train_dataset = DialogDataset(train_data, tokenizer, CONTEXT_LENGTH)
     validation_dataset = DialogDataset(dataset["validation"], tokenizer, CONTEXT_LENGTH)
     loader_options = {
@@ -101,7 +104,7 @@ def main():
     )
     print(
         f"Training rows: {len(train_data):,}; chunks: {len(train_dataset):,}; "
-        f"tokens: {len(train_dataset.tokens):,}"
+        f"tokens: {len(train_dataset):,}"
     )
 
     model = MiniGPT(
@@ -160,6 +163,66 @@ def main():
     save_checkpoint(final_path, model, optimizer, epochs, args, train_loss)
     print(f"Saved best checkpoint to {best_path}")
     print(f"Saved final checkpoint to {final_path}")
+
+    if args.mode == "overfit":
+
+        model.eval()
+
+        with torch.no_grad():
+
+            # Gennemgå alle samtaler
+            for dialog_idx, row in enumerate(train_data):
+
+                dialog = row["dialog"]
+
+                print(f"\n========== Dialog {dialog_idx + 1} ==========")
+
+                # Gennemgå alle replikker undtagen den sidste
+                for i in range(len(dialog) - 1):
+
+                    # Brug samtalen indtil dette punkt som prompt
+                    prompt = dialog[i] + "<SEP>"
+
+                    # Det svar modellen burde generere
+                    expected = dialog[i + 1]
+
+                    tokens = tokenizer.encode(prompt)
+
+                    x = torch.tensor(
+                        [tokens],
+                        dtype=torch.long,
+                        device=device
+                    )
+
+                    generated_tokens = []
+
+                    # Generer næste replik
+                    for _ in range(100):
+
+                        logits = model(x[:, -CONTEXT_LENGTH:])
+
+                        next_token = torch.argmax(
+                            logits[:, -1, :],
+                            dim=-1,
+                            keepdim=True
+                        )
+
+                        x = torch.cat([x, next_token], dim=1)
+
+                        generated_tokens.append(next_token.item())
+
+                        generated = tokenizer.decode(generated_tokens)
+
+                        # Stop ved næste replik eller samtalens afslutning
+                        if "<SEP>" in generated or "<END>" in generated:
+                            break
+
+                    generated = generated.split("<SEP>")[0].split("<END>")[0].strip()
+
+                    print(f"\nQuestion {i + 1}: {dialog[i]}")
+                    print(f"Expected: {expected}")
+                    print(f"Generated: {generated}")
+                    print(f"Correct: {generated == expected.strip()}")
 
 
 if __name__ == "__main__":
