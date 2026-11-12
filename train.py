@@ -1,27 +1,16 @@
 import argparse
 import math
-import random
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import (
-    CONTEXT_LENGTH,
-    DROPOUT,
-    EMBEDDING_DIM,
-    NUM_HEADS,
-    NUM_LAYERS,
-    REPLAY_RATIO,
-    VOCAB_SIZE,
-)
+from config import CONTEXT_LENGTH, DROPOUT, EMBEDDING_DIM, NUM_HEADS, NUM_LAYERS, VOCAB_SIZE
 from dataset import (
     DATASET_NAME,
     DialogDataset,
     IGNORE_INDEX,
-    format_row_for_tokenizer,
     load_conversation_rows,
     load_daily_dialog_rows,
     split_rows,
@@ -31,11 +20,6 @@ from tokenizer import Tokenizer
 
 
 OVERFIT_EXAMPLES = 8
-SAMPLE_PROMPTS = (
-    "Hello",
-    "What's the best way to relax?",
-    "What do you do for fun?",
-)
 
 
 def parse_args():
@@ -54,23 +38,6 @@ def parse_args():
     parser.add_argument("--label-smoothing", type=float, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument(
-        "--replay-ratio",
-        type=float,
-        default=REPLAY_RATIO,
-        help="Fraction of DailyDialog replay examples mixed into full fine-tuning per epoch (0 disables)",
-    )
-    parser.add_argument(
-        "--sample-every",
-        type=int,
-        default=5,
-        help="Print live sample generations every N epochs in pretrain/full mode (0 disables)",
-    )
-    parser.add_argument(
-        "--no-amp",
-        action="store_true",
-        help="Disable automatic mixed precision (bf16/fp16) on CUDA",
-    )
-    parser.add_argument(
         "--retrain-tokenizer",
         action="store_true",
         help="Retrain tokenizer.json on combined DailyDialog + conversation training splits",
@@ -81,19 +48,10 @@ def parse_args():
     parser.add_argument(
         "--patience",
         type=int,
-        default=4,
+        default=3,
         help="Stop full and pretrain mode after this many epochs without a better validation loss (0 disables)",
     )
     return parser.parse_args()
-
-
-def get_amp_setup(device: torch.device, disable_amp: bool):
-    if disable_amp or device.type != "cuda":
-        return nullcontext(), None, "fp32"
-    if torch.cuda.is_bf16_supported():
-        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16), None, "bf16"
-    scaler = torch.amp.GradScaler("cuda")
-    return torch.amp.autocast(device_type="cuda", dtype=torch.float16), scaler, "fp16"
 
 
 def build_optimizer(model, learning_rate, weight_decay):
@@ -133,7 +91,7 @@ def build_scheduler(optimizer, total_steps, warmup_ratio=0.1, min_lr_ratio=0.1):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def evaluate(model, data_loader, criterion, device, amp_ctx):
+def evaluate(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -141,55 +99,18 @@ def evaluate(model, data_loader, criterion, device, amp_ctx):
 
     with torch.no_grad():
         for x, y in data_loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            with amp_ctx:
-                logits = model(x)
-                batch_loss = criterion(
-                    logits.reshape(-1, logits.size(-1)), y.reshape(-1)
-                )
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
             valid_targets = y != IGNORE_INDEX
             token_count = valid_targets.sum().item()
-            total_loss += batch_loss.item()
+            total_loss += criterion(
+                logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+            ).item()
             total_tokens += token_count
             correct += ((logits.argmax(dim=-1) == y) & valid_targets).sum().item()
 
-    avg_token_loss = total_loss / total_tokens
-    total_chars = getattr(data_loader.dataset, "total_target_chars", 0)
-    bpc = (total_loss / math.log(2.0)) / max(1, total_chars)
-    return avg_token_loss, correct / total_tokens, bpc
-
-
-@torch.no_grad()
-def preview_samples(model, tokenizer, device, amp_ctx, prompts=SAMPLE_PROMPTS, max_new_tokens=48):
-    model.eval()
-    print("  Sample previews:")
-    for question in prompts:
-        prompt = question + "<SEP>"
-        x = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
-        for _ in range(max_new_tokens):
-            with amp_ctx:
-                logits = model(x[:, -model.context_length :])[:, -1, :]
-            probs = torch.softmax(logits / 0.65, dim=-1)
-            cutoff = probs.max(dim=-1, keepdim=True).values * 0.08
-            filtered = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
-            filtered = filtered / filtered.sum(dim=-1, keepdim=True)
-            next_token = torch.multinomial(filtered, num_samples=1)
-            x = torch.cat((x, next_token), dim=1)
-            decoded = tokenizer.decode(x[0].tolist())[len(prompt) :]
-            if "<END>" in decoded or "<SEP>" in decoded:
-                break
-        answer = tokenizer.decode(x[0].tolist())[len(prompt) :]
-        answer = answer.split("<END>")[0].split("<SEP>")[0].strip()
-        print(f"    Q: {question} -> A: {answer}")
-
-
-def _detect_architecture(saved_cfg, state_dict):
-    if "architecture" in saved_cfg:
-        return saved_cfg["architecture"]
-    if any("attention.qkv.weight" in k for k in state_dict):
-        return "modern"
-    return "legacy"
+    return total_loss / total_tokens, correct / total_tokens
 
 
 def save_checkpoint(path, model, optimizer, epoch, args, loss):
@@ -208,7 +129,6 @@ def save_checkpoint(path, model, optimizer, epoch, args, loss):
                 "num_heads": model.blocks[0].num_heads if len(model.blocks) > 0 else NUM_HEADS,
                 "num_layers": len(model.blocks),
                 "tie_weights": model.tie_weights,
-                "architecture": model.architecture,
             },
         },
         path,
@@ -219,30 +139,10 @@ def _train_combined_tokenizer(tokenizer, seed):
     conv_train, _ = split_rows(load_conversation_rows(), seed=seed)
     pretrain_train, _ = load_daily_dialog_rows()
     combined_texts = (
-        format_row_for_tokenizer(row) for row in (pretrain_train + conv_train)
+        row["Text"] + "<SEP>" + row["Answer"] + "<END>"
+        for row in (pretrain_train + conv_train)
     )
     tokenizer.train(combined_texts, vocab_size=VOCAB_SIZE)
-
-
-def _build_full_epoch_loader(
-    base_rows,
-    replay_pool,
-    replay_ratio,
-    epoch,
-    seed,
-    tokenizer,
-    context_length,
-    batch_size,
-    loader_options,
-):
-    rows = list(base_rows)
-    if replay_pool and replay_ratio > 0.0:
-        replay_count = int(round(len(base_rows) * replay_ratio / max(1e-6, 1.0 - replay_ratio)))
-        replay_count = min(replay_count, len(replay_pool))
-        rng = random.Random(seed + epoch)
-        rows.extend(rng.sample(replay_pool, replay_count))
-    dataset = DialogDataset(rows, tokenizer, context_length)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, **loader_options)
 
 
 def main():
@@ -274,14 +174,13 @@ def main():
         dropout = 0.0 if args.mode == "overfit" else (0.3 if args.mode == "full" else DROPOUT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_ctx, scaler, precision_name = get_amp_setup(device, args.no_amp)
-    replay_ratio = args.replay_ratio if args.mode == "full" else 0.0
     print(
-        f"Mode: {args.mode}; device: {device} ({precision_name}); epochs: {epochs}; "
-        f"batch size: {batch_size}; lr: {learning_rate:g}; weight decay: {weight_decay}; "
-        f"dropout: {dropout}; label smoothing: {label_smoothing}; replay: {replay_ratio:.0%}"
+        f"Mode: {args.mode}; device: {device}; epochs: {epochs}; batch size: {batch_size}; "
+        f"lr: {learning_rate:g}; weight decay: {weight_decay}; dropout: {dropout}; "
+        f"label smoothing: {label_smoothing}"
     )
 
+    # Overfit mode har ingen validation
     use_validation = args.mode != "overfit"
 
     tokenizer = Tokenizer()
@@ -289,17 +188,17 @@ def main():
         print(f"Training tokenizer (vocab_size={VOCAB_SIZE})...")
         _train_combined_tokenizer(tokenizer, seed=args.seed)
 
-    replay_pool = []
     if args.mode == "pretrain":
+        # Pretraining på DailyDialog, som er meget større
         train_rows, validation_rows = load_daily_dialog_rows()
     else:
         train_rows, validation_rows = split_rows(load_conversation_rows(), seed=args.seed)
-        if replay_ratio > 0.0:
-            replay_pool, _ = load_daily_dialog_rows()
 
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
 
     if args.mode == "overfit":
+        # Kun ét svar pr. spørgsmål. Med flere forskellige svar på det samme
+        # spørgsmål kan modellen ikke lære dem alle udenad.
         first_answers = {}
         for row in train_rows:
             first_answers.setdefault(row["Text"], row)
@@ -307,6 +206,25 @@ def main():
     else:
         train_data = train_rows
     print(train_data[0])
+    train_dataset = DialogDataset(train_data, tokenizer, CONTEXT_LENGTH)
+    validation_dataset = DialogDataset(validation_rows, tokenizer, CONTEXT_LENGTH)
+    loader_options = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, **loader_options
+    )
+    validation_loader = DataLoader(
+        validation_dataset, batch_size=batch_size, shuffle=False, **loader_options
+    )
+    total_target_tokens = sum(
+        len(tokens) - prompt_len for tokens, prompt_len in train_dataset.examples
+    )
+    print(
+        f"Training rows: {len(train_data):,}; examples: {len(train_dataset):,}; "
+        f"target tokens: {total_target_tokens:,}"
+    )
 
     checkpoint = None
     model_cfg = {
@@ -316,7 +234,6 @@ def main():
         "num_heads": NUM_HEADS,
         "num_layers": NUM_LAYERS,
         "tie_weights": True,
-        "architecture": "modern",
     }
     if args.init_checkpoint is not None:
         checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=True)
@@ -324,9 +241,8 @@ def main():
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         if saved_cfg:
             model_cfg.update(saved_cfg)
-        if "tie_weights" not in saved_cfg:
-            model_cfg["tie_weights"] = "outputLayer.bias" not in state_dict
-        model_cfg["architecture"] = _detect_architecture(saved_cfg, state_dict)
+            if "tie_weights" not in saved_cfg:
+                model_cfg["tie_weights"] = "outputLayer.bias" not in state_dict
         if model_cfg["vocab_size"] != tokenizer.vocab_size:
             raise ValueError(
                 f"Checkpoint vocab_size ({model_cfg['vocab_size']}) does not match "
@@ -334,41 +250,22 @@ def main():
                 f"when using a new tokenizer."
             )
 
-    effective_ctx = model_cfg["context_length"]
-    loader_options = {
-        "num_workers": args.num_workers,
-        "pin_memory": device.type == "cuda",
-    }
-    base_train_dataset = DialogDataset(train_data, tokenizer, effective_ctx)
-    base_train_loader = DataLoader(
-        base_train_dataset, batch_size=batch_size, shuffle=True, **loader_options
-    )
-    validation_dataset = DialogDataset(validation_rows, tokenizer, effective_ctx)
-    validation_loader = DataLoader(
-        validation_dataset, batch_size=batch_size, shuffle=False, **loader_options
-    )
-    print(
-        f"Base training rows: {len(train_data):,}; packed windows: {len(base_train_dataset):,}; "
-        f"target tokens: {base_train_dataset.total_target_tokens:,}"
-    )
-
     model = MiniGPT(
         vocab_size=model_cfg["vocab_size"],
-        context_length=effective_ctx,
+        context_length=model_cfg["context_length"],
         embedding_dim=model_cfg["embedding_dim"],
         num_heads=model_cfg["num_heads"],
         num_layers=model_cfg["num_layers"],
         dropout=dropout,
         tie_weights=model_cfg["tie_weights"],
-        architecture=model_cfg["architecture"],
     ).to(device)
 
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Loaded weights from {args.init_checkpoint} (arch={model.architecture})")
+        print(f"Loaded weights from {args.init_checkpoint}")
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {param_count:,} (architecture: {model.architecture})")
+    print(f"Model parameters: {param_count:,}")
 
     train_criterion = nn.CrossEntropyLoss(
         ignore_index=IGNORE_INDEX,
@@ -377,22 +274,7 @@ def main():
     )
     eval_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
     optimizer = build_optimizer(model, learning_rate, weight_decay)
-
-    steps_per_epoch = len(base_train_loader)
-    if replay_pool and replay_ratio > 0.0:
-        sample_loader = _build_full_epoch_loader(
-            train_data,
-            replay_pool,
-            replay_ratio,
-            0,
-            args.seed,
-            tokenizer,
-            effective_ctx,
-            batch_size,
-            loader_options,
-        )
-        steps_per_epoch = len(sample_loader)
-    total_steps = max(1, steps_per_epoch * epochs)
+    total_steps = max(1, len(train_loader) * epochs)
     scheduler = None if args.mode == "overfit" else build_scheduler(optimizer, total_steps)
 
     best_selection_loss = float("inf")
@@ -401,78 +283,44 @@ def main():
     final_path = args.checkpoint_dir / f"miniGPT_{args.mode}_final.pth"
 
     for epoch in range(epochs):
-        if replay_pool and replay_ratio > 0.0:
-            epoch_train_loader = _build_full_epoch_loader(
-                train_data,
-                replay_pool,
-                replay_ratio,
-                epoch,
-                args.seed,
-                tokenizer,
-                effective_ctx,
-                batch_size,
-                loader_options,
-            )
-        else:
-            epoch_train_loader = base_train_loader
-
         model.train()
         total_loss = 0.0
         total_tokens = 0
-        for x, y in epoch_train_loader:
+        for x, y in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = train_criterion(logits.reshape(-1, model.vocab_size), y.reshape(-1))
             token_count = (y != IGNORE_INDEX).sum().item()
-
-            with amp_ctx:
-                logits = model(x)
-                loss = train_criterion(logits.reshape(-1, model.vocab_size), y.reshape(-1))
-                scaled_loss = loss / token_count
-
-            if scaler is not None:
-                scaler.scale(scaled_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-
+            (loss / token_count).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-
-            with torch.no_grad(), amp_ctx:
+            with torch.no_grad():
                 raw_loss = eval_criterion(logits.reshape(-1, model.vocab_size), y.reshape(-1))
             total_loss += raw_loss.item()
             total_tokens += token_count
 
         train_loss = total_loss / total_tokens
-        _, train_accuracy, train_bpc = evaluate(
-            model, base_train_loader, eval_criterion, device, amp_ctx
-        )
+        _, train_accuracy = evaluate(model, train_loader, eval_criterion, device)
         current_lr = optimizer.param_groups[0]["lr"]
         if use_validation:
-            validation_loss, validation_accuracy, val_bpc = evaluate(
-                model, validation_loader, eval_criterion, device, amp_ctx
+            validation_loss, validation_accuracy = evaluate(
+                model, validation_loader, eval_criterion, device
             )
             selection_loss = validation_loss
             print(
-                f"Epoch {epoch + 1}/{epochs} (lr={current_lr:.2e}): "
-                f"train loss={train_loss:.4f} (bpc={train_bpc:.3f}), train acc={train_accuracy:.2%}, "
-                f"val loss={validation_loss:.4f} (bpc={val_bpc:.3f}), val acc={validation_accuracy:.2%}"
+                f"Epoch {epoch + 1}/{epochs} (lr={current_lr:.2e}): train loss={train_loss:.4f}, "
+                f"train accuracy={train_accuracy:.2%}, validation loss={validation_loss:.4f}, "
+                f"validation accuracy={validation_accuracy:.2%}"
             )
-            if args.sample_every > 0 and (
-                (epoch + 1) % args.sample_every == 0 or epoch == epochs - 1
-            ):
-                preview_samples(model, tokenizer, device, amp_ctx)
         else:
             selection_loss = train_loss
             print(
-                f"Epoch {epoch + 1}/{epochs} (lr={current_lr:.2e}): "
-                f"train loss={train_loss:.4f} (bpc={train_bpc:.3f}), train acc={train_accuracy:.2%}"
+                f"Epoch {epoch + 1}/{epochs} (lr={current_lr:.2e}): train loss={train_loss:.4f}, "
+                f"train accuracy={train_accuracy:.2%}"
             )
 
         if selection_loss < best_selection_loss:
