@@ -88,95 +88,144 @@ def clean_daily_dialog_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _daily_dialog_pairs(split):
-    rows = []
+def _daily_dialog_dialogs(split):
+    """Byg multi-turn samtaler som lister af (user, bot) runder fra DailyDialog."""
+    dialogs = []
 
     for row in split:
+        utterances = [
+            clean_daily_dialog_text(u) for u in row["dialog"] if clean_daily_dialog_text(u)
+        ]
+        if len(utterances) < 2:
+            continue
 
-        dialog = [clean_daily_dialog_text(utterance) for utterance in row["dialog"]]
+        # Både speaker A->B (fra indeks 0) og B->A (fra indeks 1) giver naturlige
+        # multi-turn samtaler, hvor modellen altid svarer på den seneste replik.
+        for start in (0, 1):
+            turns = []
+            for i in range(start, len(utterances) - 1, 2):
+                turns.append((utterances[i], utterances[i + 1]))
+            if turns:
+                dialogs.append({"Turns": turns})
 
-        # Hver replik er spørgsmål til den næste replik
-        for i in range(len(dialog) - 1):
-            if dialog[i] and dialog[i + 1]:
-                rows.append({"Text": dialog[i], "Answer": dialog[i + 1]})
-
-    return rows
+    return dialogs
 
 
 def load_daily_dialog_rows():
-    """Hent DailyDialog til pretraining som {"Text", "Answer"} rækker."""
+    """Hent DailyDialog til pretraining som multi-turn samtaler."""
     dataset = load_dataset(PRETRAIN_DATASET_NAME)
 
     return (
-        _daily_dialog_pairs(dataset["train"]),
-        _daily_dialog_pairs(dataset["validation"]),
+        _daily_dialog_dialogs(dataset["train"]),
+        _daily_dialog_dialogs(dataset["validation"]),
     )
+
+
+def format_row_for_tokenizer(row):
+    if "Turns" in row:
+        return "".join(q + "<SEP>" + a + "<END>" for q, a in row["Turns"])
+    return row["Text"] + "<SEP>" + row["Answer"] + "<END>"
 
 
 class DialogDataset(Dataset):
     def __init__(self, data, tokenizer, context_length=128):
-
         self.context_length = context_length
         self.examples = []
+        self.total_target_chars = 0
+        self.total_target_tokens = 0
 
-        # Vi bruger END som padding, da den allerede
-        # findes i dit vocabulary.
+        # Vi bruger END som padding, da den allerede findes i vocabulary.
         # Padding-targets bliver ignoreret under træning.
         self.pad_id = tokenizer.encode("<END>")[0]
 
         for row in data:
-
-            question = row["Text"]
-            answer = row["Answer"]
-
-            # Tokenize prompt og svar
-            prompt_tokens = tokenizer.encode(
-                question + "<SEP>"
-            )
-
-            answer_tokens = tokenizer.encode(
-                answer + "<END>"
-            )
-
-            tokens = prompt_tokens + answer_tokens
-
-            # Spring eksempler over, der er for lange
-            if len(tokens) > context_length + 1:
-                continue
-
-            self.examples.append(
-                (tokens, len(prompt_tokens))
-            )
+            turns = row["Turns"] if "Turns" in row else [(row["Text"], row["Answer"])]
+            self._add_turns(turns, tokenizer)
 
         if not self.examples:
             raise ValueError("No valid training examples found.")
+
+    def _commit_window(self, window_turns):
+        tokens = []
+        target_mask = []
+        char_count = 0
+
+        for prompt_tokens, answer_tokens, ans_chars in window_turns:
+            tokens.extend(prompt_tokens)
+            # Kun sidste token i prompten (<SEP>) skal forudsige første svartoken
+            target_mask.extend([False] * (len(prompt_tokens) - 1) + [True])
+
+            tokens.extend(answer_tokens)
+            # Alle tokens i svaret (undtagen det sidste <END>, som ikke har et næste token i samme tur)
+            # skal forudsige næste token; hvis der kommer en tur mere efter <END>, skal <END> IKKE
+            # tvinges til at gætte brugerens næste spørgsmål.
+            target_mask.extend([True] * (len(answer_tokens) - 1) + [False])
+            char_count += ans_chars
+
+        if len(tokens) < 2:
+            return
+
+        # x = tokens[:-1], y = tokens[1:], mask svarer til positioner i x/y
+        mask = target_mask[:-1]
+        active_tokens = sum(mask)
+        if active_tokens == 0:
+            return
+
+        self.examples.append((tokens, mask, char_count))
+        self.total_target_chars += char_count
+        self.total_target_tokens += active_tokens
+
+    def _add_turns(self, turns, tokenizer):
+        encoded_turns = []
+        for question, answer in turns:
+            prompt_tokens = tokenizer.encode(question + "<SEP>")
+            answer_tokens = tokenizer.encode(answer + "<END>")
+            if len(prompt_tokens) + len(answer_tokens) > self.context_length + 1:
+                continue
+            encoded_turns.append((prompt_tokens, answer_tokens, len(answer) + 1))
+
+        if not encoded_turns:
+            return
+
+        # Pak sammenhængende multi-turn vinduer op til context_length + 1 tokens
+        start = 0
+        while start < len(encoded_turns):
+            window = []
+            length = 0
+            end = start
+            while end < len(encoded_turns):
+                turn_len = len(encoded_turns[end][0]) + len(encoded_turns[end][1])
+                if length + turn_len > self.context_length + 1:
+                    break
+                window.append(encoded_turns[end])
+                length += turn_len
+                end += 1
+
+            if window:
+                self._commit_window(window)
+
+            if end >= len(encoded_turns):
+                break
+            # Glid vinduet frem med overlap på sidste tur for kontekstkontinuitet
+            start = max(start + 1, end - 1)
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
+        tokens, mask, _ = self.examples[idx]
 
-        tokens, prompt_length = self.examples[idx]
-
-        # Next-token prediction
         x = tokens[:-1]
-        y = tokens[1:]
+        y = [tok if keep else IGNORE_INDEX for tok, keep in zip(tokens[1:], mask)]
 
-        # Ignorer loss på spørgsmålet,
-        # men behold forudsigelsen af første svartoken
-        for i in range(prompt_length - 1):
-            y[i] = IGNORE_INDEX
-
-        # Padding
         padding = self.context_length - len(x)
-
         x = x + [self.pad_id] * padding
         y = y + [IGNORE_INDEX] * padding
 
-        x = torch.tensor(x, dtype=torch.long)
-        y = torch.tensor(y, dtype=torch.long)
-
-        return x, y
+        return (
+            torch.tensor(x, dtype=torch.long),
+            torch.tensor(y, dtype=torch.long),
+        )
 
 
 
